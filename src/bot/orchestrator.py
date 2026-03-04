@@ -6,8 +6,10 @@ classic mode, delegates to existing full-featured handlers.
 """
 
 import asyncio
+import os
 import re
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -27,6 +29,11 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+
+# Persistent image storage directory and public URL
+TGIMG_DIR = Path("/home/ubuntu/pr/tgimg")
+TGIMG_DIR.mkdir(parents=True, exist_ok=True)
+TGIMG_URL = "https://yanhs.stream/tgimg"
 
 from ..claude.sdk_integration import StreamUpdate
 from ..config.settings import Settings
@@ -330,9 +337,18 @@ class MessageOrchestrator:
             group=10,
         )
 
-        # Photo uploads -> Claude
+        # Photo uploads -> save to disk + URL, then Claude
         app.add_handler(
             MessageHandler(filters.PHOTO, self._inject_deps(self.agentic_photo)),
+            group=10,
+        )
+
+        # Voice / audio messages -> transcribe with faster-whisper, then Claude
+        app.add_handler(
+            MessageHandler(
+                filters.VOICE | filters.AUDIO,
+                self._inject_deps(self.agentic_voice),
+            ),
             group=10,
         )
 
@@ -1203,25 +1219,34 @@ class MessageOrchestrator:
     async def agentic_photo(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """Process photo -> Claude, minimal chrome."""
+        """Process photo -> save to disk, pass file path + URL to Claude."""
         user_id = update.effective_user.id
-
-        features = context.bot_data.get("features")
-        image_handler = features.get_image_handler() if features else None
-
-        if not image_handler:
-            await update.message.reply_text("Photo processing is not available.")
-            return
 
         chat = update.message.chat
         await chat.send_action("typing")
         progress_msg = await update.message.reply_text("Working...")
 
         try:
+            # Download photo and save persistently
             photo = update.message.photo[-1]
-            processed_image = await image_handler.process_image(
-                photo, update.message.caption
+            tg_file = await photo.get_file()
+            ext = ".jpg"
+            if tg_file.file_path:
+                ext = os.path.splitext(tg_file.file_path)[1] or ".jpg"
+            filename = f"{uuid.uuid4().hex}{ext}"
+            local_path = TGIMG_DIR / filename
+            await tg_file.download_to_drive(str(local_path))
+
+            public_url = f"{TGIMG_URL}/{filename}"
+            caption = update.message.caption or ""
+            prompt = (
+                f"The user sent a photo. It has been saved to:\n"
+                f"  File path: {local_path}\n"
+                f"  Public URL: {public_url}\n\n"
+                f"Please analyze this image using the Read tool on the file path above."
             )
+            if caption:
+                prompt += f"\n\nUser's message: {caption}"
 
             claude_integration = context.bot_data.get("claude_integration")
             if not claude_integration:
@@ -1254,7 +1279,7 @@ class MessageOrchestrator:
             heartbeat = self._start_typing_heartbeat(chat)
             try:
                 claude_response = await claude_integration.run_command(
-                    prompt=processed_image.prompt,
+                    prompt=prompt,
                     working_directory=current_dir,
                     user_id=user_id,
                     session_id=session_id,
@@ -1329,6 +1354,173 @@ class MessageOrchestrator:
             logger.error(
                 "Claude photo processing failed", error=str(e), user_id=user_id
             )
+
+    async def agentic_voice(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Transcribe voice/audio with faster-whisper, then send text to Claude."""
+        user_id = update.effective_user.id
+        chat = update.message.chat
+        await chat.send_action("typing")
+
+        progress_msg = await update.message.reply_text("Transcribing...")
+
+        try:
+            voice = update.message.voice or update.message.audio
+            if not voice:
+                await progress_msg.edit_text("No audio found.")
+                return
+
+            tg_file = await voice.get_file()
+            tmp_path = f"/tmp/voice_{user_id}_{uuid.uuid4().hex}.ogg"
+            await tg_file.download_to_drive(tmp_path)
+
+            # Transcribe with faster-whisper
+            from faster_whisper import WhisperModel
+
+            model = WhisperModel("base", device="cpu", compute_type="int8")
+            segments, _info = model.transcribe(tmp_path)
+            text = " ".join(seg.text for seg in segments).strip()
+
+            # Clean up temp file
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+            if not text:
+                await progress_msg.edit_text("Could not transcribe audio.")
+                return
+
+            await progress_msg.edit_text(f"Transcribed: {text[:200]}")
+
+        except Exception as e:
+            logger.error("Voice transcription failed", error=str(e), user_id=user_id)
+            try:
+                await progress_msg.edit_text(f"Voice error: {str(e)[:200]}")
+            except Exception:
+                pass
+            return
+
+        # --- Send transcribed text to Claude (same logic as agentic_text) ---
+        message_text = text
+
+        logger.info(
+            "Agentic voice->text message",
+            user_id=user_id,
+            message_length=len(message_text),
+        )
+
+        rate_limiter = context.bot_data.get("rate_limiter")
+        if rate_limiter:
+            allowed, limit_message = await rate_limiter.check_rate_limit(user_id, 0.001)
+            if not allowed:
+                await update.message.reply_text(f"⏱️ {limit_message}")
+                return
+
+        verbose_level = self._get_verbose_level(context)
+        work_msg = await update.message.reply_text("Working...")
+
+        claude_integration = context.bot_data.get("claude_integration")
+        if not claude_integration:
+            await work_msg.edit_text(
+                "Claude integration not available. Check configuration."
+            )
+            return
+
+        current_dir = context.user_data.get(
+            "current_directory", self.settings.approved_directory
+        )
+        session_id = context.user_data.get("claude_session_id")
+        force_new = bool(context.user_data.get("force_new_session"))
+
+        tool_log: List[Dict[str, Any]] = []
+        start_time = time.time()
+        mcp_images: List[ImageAttachment] = []
+        on_stream = self._make_stream_callback(
+            verbose_level,
+            work_msg,
+            tool_log,
+            start_time,
+            mcp_images=mcp_images,
+            approved_directory=self.settings.approved_directory,
+        )
+
+        heartbeat = self._start_typing_heartbeat(chat)
+        success = True
+        try:
+            claude_response = await claude_integration.run_command(
+                prompt=message_text,
+                working_directory=current_dir,
+                user_id=user_id,
+                session_id=session_id,
+                on_stream=on_stream,
+                force_new=force_new,
+            )
+
+            if force_new:
+                context.user_data["force_new_session"] = False
+            context.user_data["claude_session_id"] = claude_response.session_id
+
+            storage = context.bot_data.get("storage")
+            if storage:
+                try:
+                    await storage.save_claude_interaction(
+                        user_id=user_id,
+                        session_id=claude_response.session_id,
+                        prompt=message_text,
+                        response=claude_response,
+                        ip_address=None,
+                    )
+                except Exception as e:
+                    logger.warning("Failed to log interaction", error=str(e))
+
+            from .utils.formatting import ResponseFormatter
+
+            formatter = ResponseFormatter(self.settings)
+            formatted_messages = formatter.format_claude_response(
+                claude_response.content
+            )
+
+        except Exception as e:
+            success = False
+            logger.error("Claude integration failed", error=str(e), user_id=user_id)
+            from .handlers.message import _format_error_message
+            from .utils.formatting import FormattedMessage
+
+            formatted_messages = [
+                FormattedMessage(_format_error_message(e), parse_mode="HTML")
+            ]
+        finally:
+            heartbeat.cancel()
+
+        try:
+            await work_msg.delete()
+        except Exception:
+            pass
+
+        for i, message in enumerate(formatted_messages):
+            if not message.text or not message.text.strip():
+                continue
+            try:
+                await update.message.reply_text(
+                    message.text,
+                    parse_mode=message.parse_mode,
+                    reply_markup=None,
+                    reply_to_message_id=(
+                        update.message.message_id if i == 0 else None
+                    ),
+                )
+                if i < len(formatted_messages) - 1:
+                    await asyncio.sleep(0.5)
+            except Exception:
+                try:
+                    await update.message.reply_text(
+                        message.text,
+                        reply_markup=None,
+                    )
+                except Exception:
+                    pass
 
     async def agentic_repo(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE

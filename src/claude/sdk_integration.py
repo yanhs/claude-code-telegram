@@ -82,6 +82,13 @@ def _make_can_use_tool_callback(
         tool_input: Dict[str, Any],
         context: ToolPermissionContext,
     ) -> Any:
+        # Block AskUserQuestion — handled via Telegram inline buttons instead
+        if tool_name == "AskUserQuestion":
+            return PermissionResultDeny(
+                message="AskUserQuestion is not available. Present your question "
+                "with numbered options directly in your text response instead."
+            )
+
         # File path validation
         if tool_name in _FILE_TOOLS:
             file_path = tool_input.get("file_path") or tool_input.get("path")
