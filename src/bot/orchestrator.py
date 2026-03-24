@@ -35,6 +35,11 @@ TGIMG_DIR = Path("/home/ubuntu/pr/tgimg")
 TGIMG_DIR.mkdir(parents=True, exist_ok=True)
 TGIMG_URL = "https://yanhs.stream/tgimg"
 
+# Persistent file storage directory and public URL
+TGFILES_DIR = Path("/home/ubuntu/pr/tgfiles")
+TGFILES_DIR.mkdir(parents=True, exist_ok=True)
+TGFILES_URL = "https://yanhs.stream/tgfiles"
+
 from ..claude.sdk_integration import StreamUpdate
 from ..config.settings import Settings
 from ..projects import PrivateTopicsUnavailableError
@@ -1089,20 +1094,37 @@ class MessageOrchestrator:
         if not file_handler:
             file = await document.get_file()
             file_bytes = await file.download_as_bytearray()
+            caption = update.message.caption or "Please review this file:"
             try:
                 content = file_bytes.decode("utf-8")
                 if len(content) > 50000:
                     content = content[:50000] + "\n... (truncated)"
-                caption = update.message.caption or "Please review this file:"
                 prompt = (
                     f"{caption}\n\n**File:** `{document.file_name}`\n\n"
                     f"```\n{content}\n```"
                 )
             except UnicodeDecodeError:
-                await progress_msg.edit_text(
-                    "Unsupported file format. Must be text-based (UTF-8)."
+                # Binary file — save to disk and pass URL to Claude
+                import uuid as _uuid
+
+                ext = Path(document.file_name).suffix if document.file_name else ""
+                saved_name = f"{_uuid.uuid4().hex}{ext}"
+                saved_path = TGFILES_DIR / saved_name
+                saved_path.write_bytes(file_bytes)
+                file_url = f"{TGFILES_URL}/{saved_name}"
+                logger.info(
+                    "Saved binary file",
+                    user_id=user_id,
+                    filename=document.file_name,
+                    path=str(saved_path),
+                    url=file_url,
                 )
-                return
+                prompt = (
+                    f"{caption}\n\n"
+                    f"**File:** `{document.file_name}`\n"
+                    f"**Saved to:** `{saved_path}`\n"
+                    f"**URL:** {file_url}\n"
+                )
 
         # Process with Claude
         claude_integration = context.bot_data.get("claude_integration")
