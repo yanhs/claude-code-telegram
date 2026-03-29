@@ -216,6 +216,7 @@ class ClaudeSDKManager:
                 system_prompt=base_prompt,
                 setting_sources=["project"],
                 stderr=_stderr_callback,
+                effort="max",
             )
 
             # Pass MCP server configuration if enabled

@@ -86,6 +86,26 @@ class SecurityValidator:
         ".vue",
         ".svelte",
         ".lock",
+        # Document formats
+        ".pdf",
+        ".csv",
+        ".xlsx",
+        ".xls",
+        ".doc",
+        ".docx",
+        ".odt",
+        ".ods",
+        ".pptx",
+        ".ppt",
+        ".rtf",
+        # Image formats
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".webp",
+        ".bmp",
+        ".svg",
     }
 
     # Forbidden filenames and patterns
@@ -253,15 +273,10 @@ class SecurityValidator:
                 )
                 return False, f"File type not allowed: {filename}"
 
-        # Check extension
+        # Check extension — allow all extensions except dangerous ones
+        # (dangerous patterns are already checked above)
         path_obj = Path(filename)
         ext = path_obj.suffix.lower()
-
-        if ext and ext not in self.ALLOWED_EXTENSIONS:
-            logger.warning(
-                "File extension not allowed", filename=filename, extension=ext
-            )
-            return False, f"File type not allowed: {ext}"
 
         # Check for hidden files (starting with .)
         if filename.startswith(".") and filename not in {".gitignore", ".gitkeep"}:

@@ -108,6 +108,10 @@ Feature flags in `src/config/features.py` control: MCP, git integration, file up
 
 All datetimes use timezone-aware UTC: `datetime.now(UTC)` (not `datetime.utcnow()`). SQLite adapters auto-convert TIMESTAMP/DATETIME columns to `datetime` objects via `detect_types=PARSE_DECLTYPES`. Model `from_row()` methods must guard `fromisoformat()` calls with `isinstance(val, str)` checks.
 
+## Safety Rules
+
+NEVER use systemctl to restart the bot. If you changed code and need a restart, run: `kill -TERM $(pgrep -f 'python -m src.main')` — this will gracefully stop the process and systemd will restart it automatically. Always warn the user before doing this: "Перезапускаюсь для применения изменений..."
+
 ## Code Style
 
 - Black (88 char line length), isort (black profile), flake8, mypy strict, autoflake for unused imports

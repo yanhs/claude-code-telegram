@@ -325,6 +325,11 @@ class MessageOrchestrator:
         for cmd, handler in handlers:
             app.add_handler(CommandHandler(cmd, self._inject_deps(handler)))
 
+        # /stop — cancel the running Claude task
+        app.add_handler(
+            CommandHandler("stop", self._inject_deps(self.agentic_stop))
+        )
+
         # Text messages -> Claude
         app.add_handler(
             MessageHandler(
@@ -424,6 +429,7 @@ class MessageOrchestrator:
                 BotCommand("status", "Show session status"),
                 BotCommand("verbose", "Set output verbosity (0/1/2)"),
                 BotCommand("repo", "List repos / switch workspace"),
+                BotCommand("stop", "Stop the running task"),
             ]
             if self.settings.enable_project_threads:
                 commands.append(BotCommand("sync_threads", "Sync project topics"))
@@ -449,6 +455,23 @@ class MessageOrchestrator:
             return commands
 
     # --- Agentic handlers ---
+
+    async def agentic_stop(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Cancel the currently running Claude task and kill subprocess."""
+        task: asyncio.Task | None = context.user_data.get("_running_task")  # type: ignore[assignment]
+        if task and not task.done():
+            task.cancel()
+            # Also kill any running claude subprocess
+            import subprocess as _sp
+            try:
+                _sp.run(["pkill", "-f", "claude.*--print"], timeout=5)
+            except Exception:
+                pass
+            await update.message.reply_text("⏹ Остановлено.")
+        else:
+            await update.message.reply_text("Ничего не выполняется.")
 
     async def agentic_start(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -899,6 +922,9 @@ class MessageOrchestrator:
         # Independent typing heartbeat — stays alive even with no stream events
         heartbeat = self._start_typing_heartbeat(chat)
 
+        # Track current task so /stop can cancel it
+        context.user_data["_running_task"] = asyncio.current_task()
+
         success = True
         try:
             claude_response = await claude_integration.run_command(
@@ -945,6 +971,12 @@ class MessageOrchestrator:
                 claude_response.content
             )
 
+        except asyncio.CancelledError:
+            success = False
+            logger.info("Task cancelled by user", user_id=user_id)
+            from .utils.formatting import FormattedMessage
+
+            formatted_messages = [FormattedMessage("Stopped.")]
         except Exception as e:
             success = False
             logger.error("Claude integration failed", error=str(e), user_id=user_id)
@@ -956,6 +988,7 @@ class MessageOrchestrator:
             ]
         finally:
             heartbeat.cancel()
+            context.user_data.pop("_running_task", None)
 
         try:
             await progress_msg.delete()
@@ -1080,7 +1113,36 @@ class MessageOrchestrator:
         file_handler = features.get_file_handler() if features else None
         prompt: Optional[str] = None
 
-        if file_handler:
+        # Check if document is an image — save to tgimg/ with original extension
+        _IMAGE_DOC_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"}
+        doc_ext = (
+            Path(document.file_name).suffix.lower() if document.file_name else ""
+        )
+        if doc_ext in _IMAGE_DOC_EXTS:
+            import uuid as _uuid
+
+            tg_file = await document.get_file()
+            filename = f"{_uuid.uuid4().hex}{doc_ext}"
+            local_path = TGIMG_DIR / filename
+            await tg_file.download_to_drive(str(local_path))
+            public_url = f"{TGIMG_URL}/{filename}"
+            caption = update.message.caption or ""
+            prompt = (
+                f"The user sent a photo. It has been saved to:\n"
+                f"  File path: {local_path}\n"
+                f"  Public URL: {public_url}\n\n"
+                f"Please analyze this image using the Read tool on the file path above."
+            )
+            if caption:
+                prompt += f"\n\nUser's message: {caption}"
+            logger.info(
+                "Saved image document to tgimg",
+                user_id=user_id,
+                filename=document.file_name,
+                path=str(local_path),
+                url=public_url,
+            )
+        elif file_handler:
             try:
                 processed_file = await file_handler.handle_document_upload(
                     document,
@@ -1091,7 +1153,7 @@ class MessageOrchestrator:
             except Exception:
                 file_handler = None
 
-        if not file_handler:
+        if not prompt and not file_handler:
             file = await document.get_file()
             file_bytes = await file.download_as_bytearray()
             caption = update.message.caption or "Please review this file:"
@@ -1156,6 +1218,7 @@ class MessageOrchestrator:
         )
 
         heartbeat = self._start_typing_heartbeat(chat)
+        context.user_data["_running_task"] = asyncio.current_task()
         try:
             claude_response = await claude_integration.run_command(
                 prompt=prompt,
@@ -1230,6 +1293,12 @@ class MessageOrchestrator:
                     except Exception as img_err:
                         logger.warning("Image send failed", error=str(img_err))
 
+        except asyncio.CancelledError:
+            try:
+                await progress_msg.edit_text("Stopped.")
+            except Exception:
+                pass
+            logger.info("Task cancelled by user", user_id=user_id)
         except Exception as e:
             from .handlers.message import _format_error_message
 
@@ -1237,6 +1306,7 @@ class MessageOrchestrator:
             logger.error("Claude file processing failed", error=str(e), user_id=user_id)
         finally:
             heartbeat.cancel()
+            context.user_data.pop("_running_task", None)
 
     async def agentic_photo(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -1299,6 +1369,7 @@ class MessageOrchestrator:
             )
 
             heartbeat = self._start_typing_heartbeat(chat)
+            context.user_data["_running_task"] = asyncio.current_task()
             try:
                 claude_response = await claude_integration.run_command(
                     prompt=prompt,
@@ -1308,8 +1379,15 @@ class MessageOrchestrator:
                     on_stream=on_stream,
                     force_new=force_new,
                 )
+            except asyncio.CancelledError:
+                try:
+                    await progress_msg.edit_text("Stopped.")
+                except Exception:
+                    pass
+                return
             finally:
                 heartbeat.cancel()
+                context.user_data.pop("_running_task", None)
 
             if force_new:
                 context.user_data["force_new_session"] = False
@@ -1469,6 +1547,7 @@ class MessageOrchestrator:
         )
 
         heartbeat = self._start_typing_heartbeat(chat)
+        context.user_data["_running_task"] = asyncio.current_task()
         success = True
         try:
             claude_response = await claude_integration.run_command(
@@ -1504,6 +1583,12 @@ class MessageOrchestrator:
                 claude_response.content
             )
 
+        except asyncio.CancelledError:
+            success = False
+            logger.info("Task cancelled by user", user_id=user_id)
+            from .utils.formatting import FormattedMessage
+
+            formatted_messages = [FormattedMessage("Stopped.")]
         except Exception as e:
             success = False
             logger.error("Claude integration failed", error=str(e), user_id=user_id)
@@ -1515,6 +1600,7 @@ class MessageOrchestrator:
             ]
         finally:
             heartbeat.cancel()
+            context.user_data.pop("_running_task", None)
 
         try:
             await work_msg.delete()
