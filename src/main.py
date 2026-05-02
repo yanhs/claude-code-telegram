@@ -3,8 +3,10 @@
 import argparse
 import asyncio
 import logging
+import os
 import signal
 import sys
+import threading
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -224,6 +226,11 @@ async def run_application(app: Dict[str, Any]) -> None:
     def signal_handler(signum: int, frame: Any) -> None:
         logger.info("Shutdown signal received", signal=signum)
         shutdown_event.set()
+        # Force exit if graceful shutdown hangs
+        def force_exit() -> None:
+            logger.error("Graceful shutdown timed out, forcing exit")
+            os._exit(1)
+        threading.Timer(15, force_exit).start()
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)

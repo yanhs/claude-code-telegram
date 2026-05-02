@@ -240,7 +240,7 @@ Activated when `ENVIRONMENT=development` or when `DEBUG=true`:
 - `development_mode = true`
 - `log_level = "DEBUG"`
 - `rate_limit_requests = 100` (more lenient)
-- `claude_timeout_seconds = 600` (longer timeout)
+- `claude_timeout_seconds = 2000` (longer timeout)
 - `enable_telemetry = false`
 
 ### Testing Environment
